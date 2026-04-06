@@ -1574,6 +1574,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       activePortId = portfolios[0].id;
     loadPort(activePortId);
   }
+  // ── sync portfolio list ตอนเปิดเว็บ ──
+  if (SCRIPT_URL) setTimeout(syncPortfoliosFromSheet, 1500);
+  initAutoSync();
 });
 
 // ════════════════════════════════════════
@@ -2067,11 +2070,14 @@ function addPortfolio() {
   document.getElementById('pmNewName').value = '';
   document.getElementById('pmNewBalance').value = '';
   toast('✅ สร้างพอร์ต "' + name + '" แล้ว', 'success');
+  // ── Sync portfolio to Sheet ──
+  if (SCRIPT_URL) _pushPortfolioNTJ(id, name, pmColor, bal, '');
 }
 
 function deletePortfolio(id) {
   const p = portfolios.find(x => x.id === id);
   if (!confirm('ลบพอร์ต "' + p.name + '"?')) return;
+  const delPortName = (portfolios.find(x => x.id === id)||{}).name || '';
   portfolios = portfolios.filter(x => x.id !== id);
   delete allTrades[id];
   localStorage.setItem('demoTrades', JSON.stringify(allTrades));
@@ -2079,6 +2085,8 @@ function deletePortfolio(id) {
   savePorts(); renderTabs(); renderPmList();
   portfolios.length === 0 ? showEmpty() : loadPort(activePortId);
   toast('🗑 ลบพอร์ตแล้ว', 'success');
+  // ── Sync delete to Sheet ──
+  if (SCRIPT_URL) _deletePortfolioMetaNTJ(id, delPortName);
 }
 
 let editPortId = null, editColor = null;
@@ -2128,11 +2136,14 @@ async function saveEditPort() {
       if (!data.success) throw new Error(data.error || 'Rename ไม่สำเร็จ');
     } catch(e) { toast('❌ Rename Sheet ไม่ได้: ' + e.message, 'error'); return; }
   }
+  const oldPortName = p.name;
   p.name = name; p.initBalance = bal; p.color = editColor;
   savePorts(); renderTabs(); renderPmList();
   if (activePortId === editPortId) { document.getElementById('portNameLabel').textContent = name; document.getElementById('portColorDot').style.background = editColor; renderDash(editPortId); }
   cancelEditPort();
   toast('✅ อัปเดตพอร์ตแล้ว', 'success');
+  // ── Sync portfolio update to Sheet ──
+  if (SCRIPT_URL) _pushPortfolioNTJ(editPortId, name, editColor, bal, '', oldPortName);
 }
 
 function cancelEditPort() { editPortId = null; editColor = null; const p = document.getElementById('pmEditPanel'); p.innerHTML=''; p.style.display='none'; }
@@ -2171,11 +2182,13 @@ let _autoSyncTimer = null;
 
 async function syncNow() {
   if (!SCRIPT_URL) { toast('⚠️ กรุณาตั้ง Script URL ก่อน', 'error'); return; }
-  if (!activePortId) { toast('⚠️ ยังไม่ได้เลือก Portfolio', 'error'); return; }
   const el = document.getElementById('syncStatus');
   if (el) el.textContent = '⏳ กำลัง Sync...';
   try {
-    await loadPort(activePortId);
+    // ── sync portfolio list ก่อน ──
+    await syncPortfoliosFromSheet();
+    // ── sync trades ของ active port ──
+    if (activePortId) await loadPort(activePortId);
     const now = new Date().toLocaleTimeString('th-TH');
     if (el) el.textContent = '✅ Sync สำเร็จ ' + now;
     toast('✅ Sync สำเร็จ', 'success');
@@ -2207,10 +2220,65 @@ function initAutoSync() {
   }
 }
 
+// ════════════════════════════════════════════════
+// PORTFOLIO SYNC HELPERS (NTJ)
+// ════════════════════════════════════════════════
+function _pushPortfolioNTJ(id, name, color, initBalance, fund, oldName) {
+  if (!SCRIPT_URL) return;
+  const payload = { action:'savePortfolio', id, name, color:color||'', initBalance:initBalance||0, fund:fund||'', source:'NTJ' };
+  if (oldName && oldName !== name) payload.oldName = oldName;
+  fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) })
+    .catch(() => {});
+}
+
+function _deletePortfolioMetaNTJ(id, name) {
+  if (!SCRIPT_URL) return;
+  fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ action:'deletePortfolioMeta', id, name:name||id }) })
+    .catch(() => {});
+}
+
+async function syncPortfoliosFromSheet() {
+  if (!SCRIPT_URL) return;
+  try {
+    const res  = await fetch(`${SCRIPT_URL}?action=listPortfolios&_=${Date.now()}`);
+    const data = await res.json();
+    if (!data.success || !data.portfolios) return;
+    let changed = false;
+    data.portfolios.forEach(p => {
+      if (!p.id || !p.name) return;
+      // หา portfolio ที่ id ตรงกัน หรือชื่อตรงกัน
+      const existing = portfolios.find(x => x.id === p.id || x.name === p.name);
+      if (!existing) {
+        // สร้างใหม่ใน NTJ
+        portfolios.push({
+          id          : p.id,
+          name        : p.name,
+          color       : p.color || '#3d9eff',
+          initBalance : p.initBalance || 10000,
+        });
+        changed = true;
+      } else if (p.source !== 'NTJ') {
+        // อัปเดต metadata จาก TLP (ถ้าต่างกัน)
+        if (existing.name !== p.name) { existing.name = p.name; changed = true; }
+        if (p.initBalance && existing.initBalance !== p.initBalance) { existing.initBalance = p.initBalance; changed = true; }
+      }
+    });
+    if (changed) {
+      savePorts(); renderTabs();
+      toast('📁 อัปเดตพอร์ตจาก Sheet แล้ว', 'success');
+    }
+  } catch(e) {}
+}
+
 function saveSettings() {
   SCRIPT_URL = document.getElementById('sScriptUrl').value.trim();
   localStorage.setItem('scriptUrl', SCRIPT_URL);
   toast('✅ บันทึก Settings แล้ว', 'success');
+  if (SCRIPT_URL) {
+    portfolios.forEach(p => _pushPortfolioNTJ(p.id, p.name, p.color, p.initBalance, ''));
+    setTimeout(syncPortfoliosFromSheet, 2000);
+  }
   if (activePortId) loadPort(activePortId);
   initAutoSync();
 }
