@@ -1574,8 +1574,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       activePortId = portfolios[0].id;
     loadPort(activePortId);
   }
-  // ── sync portfolio list ตอนเปิดเว็บ ──
-  if (SCRIPT_URL) setTimeout(syncPortfoliosFromSheet, 1500);
+  // ── sync portfolio list + trades เบื้องหลังตอนเปิดเว็บ ──
+  if (SCRIPT_URL) {
+    setTimeout(async () => {
+      await syncPortfoliosFromSheet();
+      if (activePortId) await loadPort(activePortId, true);
+    }, 1500);
+  }
   initAutoSync();
 });
 
@@ -1807,7 +1812,16 @@ function _doSaveTrade() {
   toast('✅ บันทึกแล้ว — กำลังซิงค์ Sheet...', 'success');
   fetch(SCRIPT_URL, {
     method:'POST', headers:{'Content-Type':'text/plain'},
-    body: JSON.stringify({ action:'addTrade', trade, sheet: port.name })
+    body: JSON.stringify({ action:'addTrade', sheet: port.name, trade: Object.assign({}, trade, {
+      // TLP aliases — ให้ Log Pro อ่านได้ด้วย
+      setupClass : trade.cls      || '',
+      candle     : trade.model    || '',
+      imgLink    : trade.pictureUrl || '',
+      note       : trade.tip      || '',
+      sessions   : trade.session  || '',
+      side       : trade.position === 'Buy' ? 'Long' : trade.position === 'Sell' ? 'Short' : '',
+      portfolio  : port.name,
+    }) })
   })
   .then(r => r.json())
   .then(data => {
@@ -2152,22 +2166,49 @@ function switchPort(id) { activePortId = id; localStorage.setItem('activePortId'
 // ════════════════════════════════════════
 // LOAD PORT DATA
 // ════════════════════════════════════════
-async function loadPort(portId) {
+// ════════════════════════════════════════════════════
+// FIELD NORMALIZER NTJ — แปลงฟิลด์จาก Sheet ให้ตรงกับ Journal
+// Sheet อาจเก็บค่าจาก TLP (result=Win/BE, side=Long/Short)
+// NTJ ใช้: result=TP/Loss/Miss, position=Buy/Sell
+// ════════════════════════════════════════════════════
+function normalizeTradeNTJ(t) {
+  if (!t) return t;
+  // result: Win→TP, BE→Miss
+  if (t.result === 'Win') t.result = 'TP';
+  if (t.result === 'BE')  t.result = 'Miss';
+  // position: Long→Buy, Short→Sell
+  if (t.position === 'Long')  t.position = 'Buy';
+  if (t.position === 'Short') t.position = 'Sell';
+  // side field → position (TLP stores Long/Short in side)
+  if (!t.position && t.side) {
+    t.position = t.side === 'Long' ? 'Buy' : t.side === 'Short' ? 'Sell' : '';
+  }
+  return t;
+}
+
+async function loadPort(portId, silent) {
   const port = portfolios.find(p => p.id === portId);
   if (!port) { showEmpty(); return; }
   showDash();
   document.getElementById('portNameLabel').textContent = port.name;
   document.getElementById('portColorDot').style.background = port.color;
 
+  // แสดง Loading Overlay เฉพาะโหลดครั้งแรก (ยังไม่มีข้อมูล) และไม่ใช่ silent mode
+  const firstLoad = !allTrades[portId];
   if (SCRIPT_URL) {
-    showLoading('กำลังโหลดข้อมูลพอร์ต "' + port.name + '"');
+    if (!silent && firstLoad) showLoading('กำลังโหลดข้อมูลพอร์ต "' + port.name + '"');
     try {
-      const res  = await fetch(`${SCRIPT_URL}?action=getTrades&sheet=${encodeURIComponent(port.name)}`);
+      const res  = await fetch(`${SCRIPT_URL}?action=getTrades&sheet=${encodeURIComponent(port.name)}&_=${Date.now()}`);
       const data = await res.json();
-      if (data.success) { allTrades[portId] = data.trades || []; setConn(true); }
+      if (data.success) { allTrades[portId] = (data.trades || []).map(normalizeTradeNTJ); setConn(true); }
       else throw new Error(data.error);
-    } catch(e) { setConn(false); toast('❌ โหลดไม่ได้: ' + e.message, 'error'); if (!allTrades[portId]) allTrades[portId] = genDemo(); }
-    finally { hideLoading(); }
+    } catch(e) {
+      setConn(false);
+      if (!silent) toast('❌ โหลดไม่ได้: ' + e.message, 'error');
+      if (!allTrades[portId]) allTrades[portId] = genDemo();
+    } finally {
+      if (!silent && firstLoad) hideLoading();
+    }
   } else {
     setConn(false);
     if (!allTrades[portId]) { allTrades[portId] = genDemo(); localStorage.setItem('demoTrades', JSON.stringify(allTrades)); }
@@ -2180,21 +2221,21 @@ async function loadPort(portId) {
 // ════════════════════════════════════════
 let _autoSyncTimer = null;
 
-async function syncNow() {
-  if (!SCRIPT_URL) { toast('⚠️ กรุณาตั้ง Script URL ก่อน', 'error'); return; }
+async function syncNow(silent) {
+  if (!SCRIPT_URL) { if (!silent) toast('⚠️ กรุณาตั้ง Script URL ก่อน', 'error'); return; }
   const el = document.getElementById('syncStatus');
   if (el) el.textContent = '⏳ กำลัง Sync...';
   try {
-    // ── sync portfolio list ก่อน ──
+    // ── sync portfolio list ก่อน (เบื้องหลัง) ──
     await syncPortfoliosFromSheet();
-    // ── sync trades ของ active port ──
-    if (activePortId) await loadPort(activePortId);
+    // ── sync trades ของ active port แบบเบื้องหลัง ──
+    if (activePortId) await loadPort(activePortId, true);
     const now = new Date().toLocaleTimeString('th-TH');
-    if (el) el.textContent = '✅ Sync สำเร็จ ' + now;
-    toast('✅ Sync สำเร็จ', 'success');
+    if (el) el.textContent = '✅ Sync ' + now;
+    if (!silent) toast('✅ Sync สำเร็จ', 'success');
   } catch(e) {
     if (el) el.textContent = '❌ Sync ล้มเหลว: ' + e.message;
-    toast('❌ Sync ล้มเหลว', 'error');
+    if (!silent) toast('❌ Sync ล้มเหลว', 'error');
   }
 }
 
@@ -2204,7 +2245,8 @@ function setAutoSync() {
   localStorage.setItem('autoSyncMin', String(min));
   if (_autoSyncTimer) { clearInterval(_autoSyncTimer); _autoSyncTimer = null; }
   if (min > 0 && SCRIPT_URL) {
-    _autoSyncTimer = setInterval(() => syncNow(), min * 60 * 1000);
+    // Auto-sync แบบเบื้องหลัง ไม่แสดง toast / loading
+    _autoSyncTimer = setInterval(() => syncNow(true), min * 60 * 1000);
     toast('🔄 Auto-sync ทุก ' + min + ' นาที', 'success');
   } else if (min === 0) {
     toast('⏹ ปิด Auto-sync แล้ว', '');
@@ -2216,7 +2258,8 @@ function initAutoSync() {
   const sel = document.getElementById('autoSyncInterval');
   if (sel) sel.value = String(saved);
   if (saved > 0 && SCRIPT_URL) {
-    _autoSyncTimer = setInterval(() => syncNow(), saved * 60 * 1000);
+    // Auto-sync เบื้องหลังทุก N นาที
+    _autoSyncTimer = setInterval(() => syncNow(true), saved * 60 * 1000);
   }
 }
 
@@ -2312,7 +2355,10 @@ function saveSettings() {
   toast('✅ บันทึก Settings แล้ว', 'success');
   if (SCRIPT_URL) {
     portfolios.forEach(p => _pushPortfolioNTJ(p.id, p.name, p.color, p.initBalance, ''));
-    setTimeout(syncPortfoliosFromSheet, 2000);
+    setTimeout(async () => {
+      await syncPortfoliosFromSheet();
+      if (activePortId) await loadPort(activePortId, true);
+    }, 2000);
   }
   if (activePortId) loadPort(activePortId);
   initAutoSync();
@@ -3577,7 +3623,16 @@ function saveEditTrade() {
     const port = portfolios.find(p => p.id === portId);
     fetch(SCRIPT_URL, {
       method: 'POST', headers: { 'Content-Type': 'text/plain' },
-      body: JSON.stringify({ action: 'updateTrade', trade: updated, sheet: port?.name || '' })
+      body: JSON.stringify({ action: 'updateTrade', sheet: port?.name || '', trade: Object.assign({}, updated, {
+        // TLP aliases — ให้ Log Pro อ่านได้ด้วย
+        setupClass : updated.cls       || '',
+        candle     : updated.model     || '',
+        imgLink    : updated.pictureUrl || '',
+        note       : updated.tip       || '',
+        sessions   : updated.session   || '',
+        side       : updated.position === 'Buy' ? 'Long' : updated.position === 'Sell' ? 'Short' : '',
+        portfolio  : port?.name || '',
+      }) })
     })
     .then(r => r.json())
     .then(data => {
