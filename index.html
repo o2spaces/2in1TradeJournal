@@ -2223,52 +2223,87 @@ function initAutoSync() {
 // ════════════════════════════════════════════════
 // PORTFOLIO SYNC HELPERS (NTJ)
 // ════════════════════════════════════════════════
-function _pushPortfolioNTJ(id, name, color, initBalance, fund, oldName) {
+// ════════════════════════════════════════════════
+// PORTFOLIO REALTIME SYNC (NTJ)
+// ════════════════════════════════════════════════
+
+// Push portfolio ไป Sheet แล้วรับ list กลับมา re-render ทันที
+async function _pushPortfolioNTJ(id, name, color, initBalance, fund, oldName) {
   if (!SCRIPT_URL) return;
   const payload = { action:'savePortfolio', id, name, color:color||'', initBalance:initBalance||0, fund:fund||'', source:'NTJ' };
   if (oldName && oldName !== name) payload.oldName = oldName;
-  fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) })
-    .catch(() => {});
+  try {
+    const res  = await fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    const data = await res.json();
+    if (data.success && data.portfolios) _applyPortfoliosNTJ(data.portfolios);
+  } catch(e) {}
 }
 
-function _deletePortfolioMetaNTJ(id, name) {
+// Delete portfolio meta จาก Sheet แล้วรับ list กลับมา re-render ทันที
+async function _deletePortfolioMetaNTJ(id, name) {
   if (!SCRIPT_URL) return;
-  fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ action:'deletePortfolioMeta', id, name:name||id }) })
-    .catch(() => {});
+  try {
+    const res  = await fetch(SCRIPT_URL, { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action:'deletePortfolioMeta', id, name:name||id }) });
+    const data = await res.json();
+    if (data.success && data.portfolios) _applyPortfoliosNTJ(data.portfolios);
+  } catch(e) {}
 }
 
+// ดึง portfolio list จาก Sheet แล้ว apply
 async function syncPortfoliosFromSheet() {
   if (!SCRIPT_URL) return;
   try {
     const res  = await fetch(`${SCRIPT_URL}?action=listPortfolios&_=${Date.now()}`);
     const data = await res.json();
-    if (!data.success || !data.portfolios) return;
-    let changed = false;
-    data.portfolios.forEach(p => {
-      if (!p.id || !p.name) return;
-      // หา portfolio ที่ id ตรงกัน หรือชื่อตรงกัน
-      const existing = portfolios.find(x => x.id === p.id || x.name === p.name);
-      if (!existing) {
-        // สร้างใหม่ใน NTJ
-        portfolios.push({
-          id          : p.id,
-          name        : p.name,
-          color       : p.color || '#3d9eff',
-          initBalance : p.initBalance || 10000,
-        });
-        changed = true;
-      } else if (p.source !== 'NTJ') {
-        // อัปเดต metadata จาก TLP (ถ้าต่างกัน)
-        if (existing.name !== p.name) { existing.name = p.name; changed = true; }
-        if (p.initBalance && existing.initBalance !== p.initBalance) { existing.initBalance = p.initBalance; changed = true; }
-      }
-    });
-    if (changed) {
-      savePorts(); renderTabs();
-      toast('📁 อัปเดตพอร์ตจาก Sheet แล้ว', 'success');
-    }
+    if (data.success && data.portfolios) _applyPortfoliosNTJ(data.portfolios);
   } catch(e) {}
+}
+
+// Apply portfolio list จาก Sheet เข้า NTJ state
+function _applyPortfoliosNTJ(sheetPorts) {
+  if (!sheetPorts || !sheetPorts.length) return;
+  let changed = false;
+
+  // 1) เพิ่มหรืออัปเดต portfolio ที่มีใน Sheet
+  sheetPorts.forEach(p => {
+    if (!p.id || !p.name) return;
+    const existing = portfolios.find(x => x.id === p.id);
+    if (!existing) {
+      // พอร์ตใหม่จาก Sheet (สร้างจากอีกเว็บ)
+      portfolios.push({
+        id          : p.id,
+        name        : p.name,
+        color       : p.color || '#3d9eff',
+        initBalance : p.initBalance || 10000,
+      });
+      changed = true;
+    } else {
+      // อัปเดต metadata ถ้าต่างกัน (Sheet เป็น source of truth)
+      if (existing.name !== p.name)              { existing.name = p.name; changed = true; }
+      if (existing.color !== p.color && p.color) { existing.color = p.color; changed = true; }
+      if (p.initBalance > 0 && existing.initBalance !== p.initBalance) { existing.initBalance = p.initBalance; changed = true; }
+    }
+  });
+
+  // 2) ลบพอร์ตที่ไม่มีใน Sheet แล้ว (ลบจากอีกเว็บ)
+  const sheetIds = new Set(sheetPorts.map(p => p.id));
+  const before = portfolios.length;
+  portfolios = portfolios.filter(p => sheetIds.has(p.id));
+  if (portfolios.length !== before) {
+    changed = true;
+    // ถ้า active port ถูกลบ ให้ switch ไปพอร์ตแรก
+    if (!portfolios.find(p => p.id === activePortId)) {
+      activePortId = portfolios[0]?.id || '';
+      if (activePortId) loadPort(activePortId);
+    }
+  }
+
+  if (changed) {
+    savePorts();
+    renderTabs();
+    renderPmList();
+  }
 }
 
 function saveSettings() {
